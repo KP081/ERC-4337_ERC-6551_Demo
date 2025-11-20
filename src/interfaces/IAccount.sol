@@ -8,7 +8,7 @@ interface IAccount {
     function validateUserOp(
         UserOperation calldata userOp,
         bytes32 userOpHash,
-        uitn256 missingAccountFunds
+        uint256 missingAccountFunds
     ) external returns(uint256 validationData); 
 
 }
