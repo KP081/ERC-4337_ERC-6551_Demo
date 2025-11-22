@@ -35,11 +35,11 @@ contract SimplePaymaster is IPaymaster, Ownable {
     /**
      * @notice Validate if we should sponsor this operation
      */
-    function validatePaymasterUserOp(
+    function validatePaymasterUserOp (
         UserOperation calldata userOp,
         bytes32 userOpHash,
         uint256 maxCost
-    ) external override returns (bytes memory context, uint256 validationData) {
+    ) external override view returns (bytes memory context, uint256 validationData) {
         require(msg.sender == address(entryPoint), "Not from EntryPoint");
 
         // Check if user is whitelisted

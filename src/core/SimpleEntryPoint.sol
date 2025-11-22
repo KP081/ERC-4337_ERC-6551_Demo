@@ -4,10 +4,11 @@ pragma solidity ^0.8.20;
 import "../interfaces/IEntryPoint.sol";
 import "../interfaces/IAccount.sol";
 import "../interfaces/IPaymaster.sol";
+import "../interfaces/UserOperation.sol";
 
 /**
  * @title SimpleEntryPoint
- * @notice Simplified EntryPoint for demo purposes
+ * @notice Simplified EntryPoint for demo - Stack optimized version
  */
 contract SimpleEntryPoint is IEntryPoint {
     // Storage
@@ -24,6 +25,7 @@ contract SimpleEntryPoint is IEntryPoint {
     );
 
     event Deposited(address indexed account, uint256 totalDeposit);
+    event Withdrawn(address indexed account, uint256 amount);
 
     // Errors
     error ValidationFailed();
@@ -37,11 +39,8 @@ contract SimpleEntryPoint is IEntryPoint {
         UserOperation[] calldata ops,
         address payable beneficiary
     ) external override {
-        uint256 opsLength = ops.length;
-
-        for (uint256 i = 0; i < opsLength; i++) {
-            UserOperation calldata userOp = ops[i];
-            _handleOp(userOp, beneficiary);
+        for (uint256 i = 0; i < ops.length; i++) {
+            _handleOp(ops[i], beneficiary);
         }
     }
 
@@ -55,10 +54,12 @@ contract SimpleEntryPoint is IEntryPoint {
         uint256 preGas = gasleft();
         bytes32 userOpHash = getUserOpHash(userOp);
 
-        // Phase 1: VALIDATION
-        uint256 validationData = _validateUserOp(userOp, userOpHash);
+        // Determine who pays (account or paymaster)
+        address paymaster = _getPaymasterAddress(userOp);
+        address payer = paymaster != address(0) ? paymaster : userOp.sender;
 
-        if (validationData != 0) {
+        // Phase 1: VALIDATION
+        if (_validateOp(userOp, userOpHash) != 0) {
             revert ValidationFailed();
         }
 
@@ -66,15 +67,13 @@ contract SimpleEntryPoint is IEntryPoint {
         bool success = _executeUserOp(userOp);
 
         // Phase 3: GAS ACCOUNTING
-        uint256 actualGas = preGas - gasleft();
-        uint256 actualGasCost = actualGas * tx.gasprice;
-
-        _compensateBundler(userOp, actualGasCost, beneficiary);
+        uint256 actualGasCost = _calculateGasCost(preGas, userOp);
+        _deductAndCompensate(payer, actualGasCost, beneficiary);
 
         emit UserOperationEvent(
             userOpHash,
             userOp.sender,
-            _getPaymasterAddress(userOp),
+            paymaster,
             userOp.nonce,
             success,
             actualGasCost
@@ -82,54 +81,136 @@ contract SimpleEntryPoint is IEntryPoint {
     }
 
     /**
-     * @notice Validate user operation
+     * @notice Calculate gas cost
      */
-    function _validateUserOp(
+    function _calculateGasCost(
+        uint256 preGas,
+        UserOperation calldata userOp
+    ) internal view returns (uint256) {
+        uint256 gasUsed = preGas - gasleft() + userOp.preVerificationGas;
+        // Use userOp.maxFeePerGas as fallback (tx.gasprice is 0 in tests)
+        uint256 gasPrice = tx.gasprice > 0 ? tx.gasprice : userOp.maxFeePerGas;
+        return gasUsed * gasPrice;
+    }
+
+    /**
+     * @notice Deduct from payer and compensate bundler
+     */
+    function _deductAndCompensate(
+        address payer,
+        uint256 actualGasCost,
+        address payable beneficiary
+    ) internal {
+        if (actualGasCost == 0) return;
+
+        // Cap at available deposit
+        uint256 toDeduct = actualGasCost;
+        if (deposits[payer] < toDeduct) {
+            toDeduct = deposits[payer];
+        }
+
+        // Deduct from payer
+        deposits[payer] -= toDeduct;
+
+        // Transfer to bundler if we have ETH
+        if (toDeduct > 0 && address(this).balance >= toDeduct) {
+            (bool sent, ) = beneficiary.call{value: toDeduct}("");
+            if (!sent) {
+                // Refund if transfer fails
+                deposits[payer] += toDeduct;
+            }
+        }
+    }
+
+    /**
+     * @notice Validate user operation (simplified to avoid stack issues)
+     */
+    function _validateOp(
         UserOperation calldata userOp,
         bytes32 userOpHash
-    ) internal returns (uint256 validationData) {
-        // Calculate required prefund
-        uint256 requiredPrefund = userOp.callGasLimit * userOp.maxFeePerGas;
+    ) internal returns (uint256) {
+        uint256 requiredPrefund = _getRequiredPrefund(userOp);
+        address paymaster = _getPaymasterAddress(userOp);
 
-        // Check if paymaster will sponsor
-        if (userOp.paymasterAndData.length >= 20) {
-            address paymaster = _getPaymasterAddress(userOp);
-
-            // Validate with paymaster
-            try
-                IPaymaster(paymaster).validatePaymasterUserOp(
+        // Validate paymaster if present
+        if (paymaster != address(0)) {
+            if (
+                !_validatePaymaster(
                     userOp,
                     userOpHash,
-                    requiredPrefund
+                    requiredPrefund,
+                    paymaster
                 )
-            returns (bytes memory context, uint256 _validationData) {
-                validationData = _validationData;
-            } catch {
-                return 1; // Validation failed
+            ) {
+                return 1;
             }
         } else {
-            // Account pays itself
+            // Account pays - check deposit
             if (deposits[userOp.sender] < requiredPrefund) {
                 revert InsufficientDeposit();
             }
         }
 
-        // Validate with account
+        // Validate account signature
+        return _validateAccount(userOp, userOpHash);
+    }
+
+    /**
+     * @notice Validate paymaster
+     */
+    function _validatePaymaster(
+        UserOperation calldata userOp,
+        bytes32 userOpHash,
+        uint256 requiredPrefund,
+        address paymaster
+    ) internal returns (bool) {
         try
-            IAccount(userOp.sender).validateUserOp(
+            IPaymaster(paymaster).validatePaymasterUserOp(
                 userOp,
                 userOpHash,
                 requiredPrefund
             )
-        returns (uint256 _validationData) {
-            if (_validationData != 0) {
-                validationData = _validationData;
+        returns (bytes memory, uint256 validationData) {
+            if (validationData != 0) return false;
+            if (deposits[paymaster] < requiredPrefund) {
+                revert InsufficientDeposit();
             }
+            return true;
         } catch {
-            return 1; // Validation failed
+            return false;
         }
+    }
 
-        return validationData;
+    /**
+     * @notice Validate account signature
+     */
+    function _validateAccount(
+        UserOperation calldata userOp,
+        bytes32 userOpHash
+    ) internal returns (uint256) {
+        try
+            IAccount(userOp.sender).validateUserOp(
+                userOp,
+                userOpHash,
+                0 // No prefund request - we use deposit system
+            )
+        returns (uint256 validationData) {
+            return validationData;
+        } catch {
+            return 1;
+        }
+    }
+
+    /**
+     * @notice Calculate required prefund for UserOp
+     */
+    function _getRequiredPrefund(
+        UserOperation calldata userOp
+    ) internal pure returns (uint256) {
+        uint256 maxGas = userOp.callGasLimit +
+            userOp.verificationGasLimit +
+            userOp.preVerificationGas;
+        return maxGas * userOp.maxFeePerGas;
     }
 
     /**
@@ -141,30 +222,6 @@ contract SimpleEntryPoint is IEntryPoint {
         (success, ) = userOp.sender.call{gas: userOp.callGasLimit}(
             userOp.callData
         );
-
-        return success;
-    }
-
-    /**
-     * @notice Compensate bundler for gas
-     */
-    function _compensateBundler(
-        UserOperation calldata userOp,
-        uint256 actualGasCost,
-        address payable beneficiary
-    ) internal {
-        address paymaster = _getPaymasterAddress(userOp);
-
-        if (paymaster != address(0)) {
-            // Paymaster pays
-            deposits[paymaster] -= actualGasCost;
-        } else {
-            // Account pays
-            deposits[userOp.sender] -= actualGasCost;
-        }
-
-        // Transfer to bundler
-        beneficiary.transfer(actualGasCost);
     }
 
     /**
@@ -176,7 +233,6 @@ contract SimpleEntryPoint is IEntryPoint {
         if (userOp.paymasterAndData.length < 20) {
             return address(0);
         }
-
         return address(bytes20(userOp.paymasterAndData[0:20]));
     }
 
@@ -189,6 +245,22 @@ contract SimpleEntryPoint is IEntryPoint {
         return
             keccak256(
                 abi.encode(
+                    _packUserOpData(userOp),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /**
+     * @notice Pack UserOp data for hashing (avoids stack too deep)
+     */
+    function _packUserOpData(
+        UserOperation calldata userOp
+    ) internal pure returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
                     userOp.sender,
                     userOp.nonce,
                     keccak256(userOp.initCode),
@@ -198,9 +270,7 @@ contract SimpleEntryPoint is IEntryPoint {
                     userOp.preVerificationGas,
                     userOp.maxFeePerGas,
                     userOp.maxPriorityFeePerGas,
-                    keccak256(userOp.paymasterAndData),
-                    block.chainid,
-                    address(this)
+                    keccak256(userOp.paymasterAndData)
                 )
             );
     }
@@ -222,8 +292,25 @@ contract SimpleEntryPoint is IEntryPoint {
         return deposits[account];
     }
 
+    /**
+     * @notice Withdraw deposit
+     */
+    function withdrawTo(
+        address payable withdrawAddress,
+        uint256 amount
+    ) external {
+        require(deposits[msg.sender] >= amount, "Insufficient deposit");
+        deposits[msg.sender] -= amount;
+
+        (bool success, ) = withdrawAddress.call{value: amount}("");
+        require(success, "Withdraw failed");
+
+        emit Withdrawn(msg.sender, amount);
+    }
+
     // Receive ETH
     receive() external payable {
         deposits[msg.sender] += msg.value;
+        emit Deposited(msg.sender, deposits[msg.sender]);
     }
 }
