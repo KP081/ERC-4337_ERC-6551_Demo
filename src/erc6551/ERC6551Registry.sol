@@ -27,7 +27,7 @@ contract ERC6551Registry {
      * @param tokenId The NFT token ID
      * @param salt Extra salt for deterministic address
      * @param initData Initialization data (optional)
-     * @return account_ The created account address
+     * @return account The created account address
      */
     function createAccount(
         address implementation,
@@ -36,7 +36,7 @@ contract ERC6551Registry {
         uint256 tokenId,
         uint256 salt,
         bytes calldata initData
-    ) external returns (address account_) {
+    ) external returns (address account) {
         // Pack the account data
         bytes memory code = _creationCode(
             implementation,
@@ -50,32 +50,47 @@ contract ERC6551Registry {
         bytes32 saltHash = _getSalt(chainId, tokenContract, tokenId, salt);
 
         // Check if already deployed
-        account_ = _computeAddress(saltHash, keccak256(code));
+        account = _computeAddress(saltHash, keccak256(code));
 
-        if (account_.code.length != 0) {
+        if (account.code.length != 0) {
             // Already deployed, return existing address
-            return account_;
+            return account;
         }
 
         // Deploy using CREATE2
         assembly {
-            account_ := create2(0, add(code, 0x20), mload(code), saltHash)
+            account := create2(0, add(code, 0x20), mload(code), saltHash)
         }
 
-        if (account_ == address(0)) {
+        if (account == address(0)) {
             revert InitializationFailed();
         }
 
-        // Initialize if data provided
+        // Initialize the account with NFT context
+        (bool success, ) = account.call(
+            abi.encodeWithSignature(
+                "initialize(uint256,uint256,address,uint256)",
+                salt,
+                chainId,
+                tokenContract,
+                tokenId
+            )
+        );
+
+        if (!success) {
+            revert InitializationFailed();
+        }
+
+        // Additional initialization if data provided
         if (initData.length > 0) {
-            (bool success, ) = account_.call(initData);
+            (success, ) = account.call(initData);
             if (!success) {
                 revert InitializationFailed();
             }
         }
 
         emit ERC6551AccountCreated(
-            account_,
+            account,
             implementation,
             saltHash,
             chainId,

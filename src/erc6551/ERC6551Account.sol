@@ -6,17 +6,21 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /**
  * @title ERC6551Account
  * @notice Token Bound Account implementation
- * @dev Each NFT gets its own smart contract wallet!
  */
 contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
-    using ECDSA for bytes32;
-    using MessageHashUtils for bytes32;
+    // Storage slot for NFT context (to avoid reading from bytecode)
+    bytes32 private constant _CONTEXT_SLOT = keccak256("erc6551.context");
+
+    struct AccountContext {
+        uint256 salt;
+        uint256 chainId;
+        address tokenContract;
+        uint256 tokenId;
+    }
 
     // Events
     event TransactionExecuted(
@@ -24,42 +28,101 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
         uint256 value,
         bytes data
     );
+    event ContextInitialized(
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId
+    );
 
     // Errors
     error NotAuthorized();
     error InvalidInput();
     error ExecutionFailed();
+    error AlreadyInitialized();
+
+    /**
+     * @notice Initialize the account context (called once after deployment)
+     */
+    function initialize(
+        uint256 salt,
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId
+    ) external {
+        AccountContext memory ctx = _getContext();
+
+        // Prevent re-initialization
+        if (ctx.chainId != 0) {
+            revert AlreadyInitialized();
+        }
+
+        // Store context
+        _setContext(
+            AccountContext({
+                salt: salt,
+                chainId: chainId,
+                tokenContract: tokenContract,
+                tokenId: tokenId
+            })
+        );
+
+        emit ContextInitialized(chainId, tokenContract, tokenId);
+    }
 
     /**
      * @notice Get the NFT that owns this account
-     * @dev Info is stored in the account's bytecode
-     * @return chainId The chain ID
-     * @return tokenContract The NFT contract address
-     * @return tokenId The NFT token ID
+     * @dev Reads from storage slot instead of bytecode
      */
     function token()
         public
         view
         returns (uint256 chainId, address tokenContract, uint256 tokenId)
     {
-        // The last 96 bytes of deployed code contain NFT info
-        bytes memory footer = new bytes(0x60); // 96 bytes
+        AccountContext memory ctx = _getContext();
 
-        assembly {
-            // Copy from deployed bytecode
-            extcodecopy(address(), add(footer, 0x20), 0x4d, 0x60)
+        // If not initialized, try reading from bytecode (fallback)
+        if (ctx.chainId == 0) {
+            return _tokenFromBytecode();
         }
 
-        // Decode: salt, chainId, tokenContract, tokenId
-        (, chainId, tokenContract, tokenId) = abi.decode(
-            footer,
-            (uint256, uint256, address, uint256)
-        );
+        return (ctx.chainId, ctx.tokenContract, ctx.tokenId);
+    }
+
+    /**
+     * @notice Fallback: Read NFT info from bytecode
+     */
+    function _tokenFromBytecode()
+        internal
+        view
+        returns (uint256 chainId, address tokenContract, uint256 tokenId)
+    {
+        // EIP-1167 minimal proxy is 45 bytes + 96 bytes of data = 141 bytes minimum
+        // Our implementation adds: 45 (proxy) + 96 (data) = 141 bytes
+
+        assembly {
+            let size := extcodesize(address())
+
+            // Need at least 96 bytes
+            if lt(size, 96) {
+                revert(0, 0)
+            }
+
+            // Allocate memory for 96 bytes
+            let ptr := mload(0x40)
+
+            // Copy last 96 bytes from deployed code
+            extcodecopy(address(), ptr, sub(size, 96), 96)
+
+            // Load the values (each 32 bytes)
+            // Skip salt (first 32 bytes)
+            chainId := mload(add(ptr, 32))
+            tokenContract := mload(add(ptr, 64))
+            tokenId := mload(add(ptr, 96))
+        }
     }
 
     /**
      * @notice Get the owner of this account (NFT holder)
-     * @return The current NFT owner's address
      */
     function owner() public view returns (address) {
         (uint256 chainId, address tokenContract, uint256 tokenId) = token();
@@ -75,11 +138,6 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
 
     /**
      * @notice Execute a transaction from this account
-     * @dev Only the NFT owner can call this
-     * @param to Target contract address
-     * @param value Amount of ETH to send
-     * @param data Transaction data
-     * @return result The return data from the call
      */
     function executeCall(
         address to,
@@ -87,7 +145,8 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
         bytes calldata data
     ) external payable returns (bytes memory result) {
         // Only NFT owner can execute
-        if (msg.sender != owner()) {
+        address currentOwner = owner();
+        if (msg.sender != currentOwner) {
             revert NotAuthorized();
         }
 
@@ -101,9 +160,12 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
         (success, result) = to.call{value: value}(data);
 
         if (!success) {
-            // Bubble up the revert reason
-            assembly {
-                revert(add(result, 32), mload(result))
+            if (result.length > 0) {
+                assembly {
+                    revert(add(result, 32), mload(result))
+                }
+            } else {
+                revert ExecutionFailed();
             }
         }
 
@@ -124,11 +186,34 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
         return address(this).balance;
     }
 
-    /**
-     * @notice Check if this account is valid on current chain
-     */
-    function isValidSigner(address signer) public view returns (bool) {
-        return signer == owner();
+    // ============ Internal Storage Functions ============
+
+    function _getContext() internal view returns (AccountContext memory ctx) {
+        bytes32 slot = _CONTEXT_SLOT;
+        assembly {
+            let ptr := mload(0x40)
+            // Load 4 slots (32 bytes each = 128 bytes total)
+            mstore(ptr, sload(slot))
+            mstore(add(ptr, 32), sload(add(slot, 1)))
+            mstore(add(ptr, 64), sload(add(slot, 2)))
+            mstore(add(ptr, 96), sload(add(slot, 3)))
+
+            // Decode into struct
+            mstore(ctx, mload(ptr)) // salt
+            mstore(add(ctx, 32), mload(add(ptr, 32))) // chainId
+            mstore(add(ctx, 64), mload(add(ptr, 64))) // tokenContract
+            mstore(add(ctx, 96), mload(add(ptr, 96))) // tokenId
+        }
+    }
+
+    function _setContext(AccountContext memory ctx) internal {
+        bytes32 slot = _CONTEXT_SLOT;
+        assembly {
+            sstore(slot, mload(ctx)) // salt
+            sstore(add(slot, 1), mload(add(ctx, 32))) // chainId
+            sstore(add(slot, 2), mload(add(ctx, 64))) // tokenContract
+            sstore(add(slot, 3), mload(add(ctx, 96))) // tokenId
+        }
     }
 
     // ============ ERC-165 Support ============
@@ -177,4 +262,3 @@ contract ERC6551Account is IERC165, IERC721Receiver, IERC1155Receiver {
 
     receive() external payable {}
 }
- 
